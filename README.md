@@ -1,6 +1,6 @@
 # image-tools
 
-A personal experimental toolkit for exploring image processing, depth extraction, and photogrammetry workflows. Each script is a self-contained CLI tool with consistent behavior: auto venv detection, dependency management, interactive mode, and batch processing support.
+A personal experimental toolkit for exploring what can be extracted and created from images — depth maps, edge detection, panoramas, anaglyph 3D, and more. Each script is a self-contained CLI tool with consistent behavior: auto venv detection, dependency management, interactive mode, and batch processing support.
 
 ## Scripts
 
