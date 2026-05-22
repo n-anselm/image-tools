@@ -24,3 +24,4 @@ python anaglyph_3d.py photo.png -i
 
 Run any script with `--help` for full usage details.
 
+![image](https://github.com/n-anselm/image-tools/blob/main/assets/image-tools-info.jpg)
