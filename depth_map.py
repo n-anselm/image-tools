@@ -113,6 +113,8 @@ Examples:
   %(prog)s photo.png
   %(prog)s photo.png depth.png --model dpt-large
   %(prog)s ./photos/ ./depthmaps/ --colormap viridis
+  %(prog)s photo.png --close 10 --far 10 --gamma 0.8
+  %(prog)s photo.png --auto-contrast --gamma 1.2
   %(prog)s photo.png -i
         """,
     )
@@ -187,6 +189,34 @@ Examples:
         "--recursive",
         action="store_true",
         help="Recursively scan subdirectories for images when a folder is provided",
+    )
+
+    # Depth post-processing
+    parser.add_argument(
+        "--close",
+        type=int,
+        default=0,
+        metavar="0-100",
+        help="Percentile to clip from the near end. 10 = ignore the closest 10%% of pixels. (default: 0)",
+    )
+    parser.add_argument(
+        "--far",
+        type=int,
+        default=0,
+        metavar="0-100",
+        help="Percentile to clip from the far end. 10 = ignore the farthest 10%% of pixels. (default: 0)",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=1.0,
+        metavar="0.5-2.0",
+        help="Gamma correction after stretching. < 1.0 brightens near-field; > 1.0 emphasizes distance. (default: 1.0)",
+    )
+    parser.add_argument(
+        "--auto-contrast",
+        action="store_true",
+        help="Automatically compute --close and --far from the depth histogram (5th/95th percentile). Overrides explicit values.",
     )
 
     return parser
@@ -464,6 +494,66 @@ def _colormap_from_name(name: str) -> int:
     return cmap_map.get(name, cv2.COLORMAP_VIRIDIS)
 
 
+def _normalize_depth(
+    depth_np: np.ndarray,
+    close: int,
+    far: int,
+    gamma: float,
+    auto_contrast: bool,
+) -> np.ndarray:
+    """
+    Normalize a raw depth map with optional clipping, stretching, and gamma.
+
+    Pipeline:
+      1. Clip percentile tails (close from near end, far from far end).
+      2. Linearly stretch the remaining range to [0, 1].
+      3. Apply gamma correction.
+      4. Scale to [0, 255] and convert to uint8.
+
+    Args:
+        depth_np: Raw depth values as float32 array.
+        close: Percentile to clip from the near (high) end (0-100).
+        far: Percentile to clip from the far (low) end (0-100).
+        gamma: Gamma exponent. 1.0 = linear.
+        auto_contrast: If True, compute close/far from 5th/95th percentiles.
+
+    Returns:
+        Normalized depth as uint8 array in [0, 255].
+    """
+    if auto_contrast:
+        p_low = float(np.percentile(depth_np, 5.0))
+        p_high = float(np.percentile(depth_np, 95.0))
+        logger.info(
+            "Auto-contrast: clipping at raw depth values far=%.2f, close=%.2f",
+            p_low,
+            p_high,
+        )
+    else:
+        p_low = float(np.percentile(depth_np, float(far)))
+        p_high = float(np.percentile(depth_np, 100.0 - float(close)))
+
+    if p_high <= p_low:
+        logger.warning(
+            "Depth clip range is empty (low=%.4f, high=%.4f). Falling back to min-max.",
+            p_low,
+            p_high,
+        )
+        d_min, d_max = depth_np.min(), depth_np.max()
+        if d_max > d_min:
+            depth_norm = (depth_np - d_min) / (d_max - d_min)
+        else:
+            depth_norm = np.zeros_like(depth_np)
+    else:
+        clipped = np.clip(depth_np, p_low, p_high)
+        depth_norm = (clipped - p_low) / (p_high - p_low)
+
+    # Gamma: applied to the already-stretched [0,1] range
+    if gamma != 1.0:
+        depth_norm = np.power(depth_norm, float(gamma))
+
+    return (255 * depth_norm).astype(np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # 6. Input / Output helpers
 # ---------------------------------------------------------------------------
@@ -571,6 +661,10 @@ def process_images(
     device_pref: str,
     invert: bool,
     batch_size: int,
+    close: int,
+    far: int,
+    gamma: float,
+    auto_contrast: bool,
 ) -> int:
     """
     Run depth estimation on a list of images and save the results.
@@ -583,6 +677,10 @@ def process_images(
         device_pref: 'auto', 'cuda', or 'cpu'.
         invert: Whether to invert depth (ControlNet style).
         batch_size: How many images to feed the pipeline at once.
+        close: Percentile to clip from the near end.
+        far: Percentile to clip from the far end.
+        gamma: Gamma correction exponent.
+        auto_contrast: Whether to auto-compute clip percentiles.
 
     Returns:
         Number of successfully processed images.
@@ -640,17 +738,14 @@ def process_images(
             depth = result["depth"]  # PIL Image, mode=L
             depth_np = np.array(depth).astype(np.float32)
 
-            d_min, d_max = depth_np.min(), depth_np.max()
-            if d_max > d_min:
-                depth_norm = (depth_np - d_min) / (d_max - d_min)
-            else:
-                depth_norm = np.zeros_like(depth_np)
+            # Normalize with optional clipping, stretching, and gamma
+            depth_8bit = _normalize_depth(
+                depth_np, close, far, gamma, auto_contrast
+            )
 
             # Invert for ControlNet convention by default
             if invert:
-                depth_8bit = (255 * (1.0 - depth_norm)).astype(np.uint8)
-            else:
-                depth_8bit = (255 * depth_norm).astype(np.uint8)
+                depth_8bit = 255 - depth_8bit
 
             if use_grayscale:
                 result_array = depth_8bit
@@ -802,6 +897,64 @@ def interactive_configure(args: argparse.Namespace) -> argparse.Namespace:
                 pass
             print("  Invalid choice. Please enter a positive integer.")
 
+        # Depth post-processing
+        print("\n--- Depth Post-Processing ---")
+        args.auto_contrast = _ask_user(
+            "Use auto-contrast (automatically clip depth tails)?",
+            default=False,
+        )
+        if not args.auto_contrast:
+            # Close clip
+            while True:
+                choice = input(
+                    "Clip close percentile [0-100, default: 0]: "
+                ).strip()
+                if not choice:
+                    args.close = 0
+                    break
+                try:
+                    val = int(choice)
+                    if 0 <= val <= 100:
+                        args.close = val
+                        break
+                except ValueError:
+                    pass
+                print("  Invalid choice. Please enter 0-100.")
+
+            # Far clip
+            while True:
+                choice = input(
+                    "Clip far percentile [0-100, default: 0]: "
+                ).strip()
+                if not choice:
+                    args.far = 0
+                    break
+                try:
+                    val = int(choice)
+                    if 0 <= val <= 100:
+                        args.far = val
+                        break
+                except ValueError:
+                    pass
+                print("  Invalid choice. Please enter 0-100.")
+
+        # Gamma
+        while True:
+            choice = input(
+                "Gamma correction [0.1-3.0, default: 1.0]: "
+            ).strip()
+            if not choice:
+                args.gamma = 1.0
+                break
+            try:
+                val = float(choice)
+                if 0.1 <= val <= 3.0:
+                    args.gamma = val
+                    break
+            except ValueError:
+                pass
+            print("  Invalid choice. Please enter 0.1-3.0.")
+
     print("\n" + "=" * 60)
     print("  Configuration complete!")
     print("=" * 60 + "\n")
@@ -821,6 +974,16 @@ def main() -> int:
     # Interactive configuration overrides CLI flags
     if args.interactive:
         args = interactive_configure(args)
+
+    # Validate depth clip ranges
+    if not args.auto_contrast and args.close + args.far >= 100:
+        logger.error(
+            "Invalid clip range: --close %d + --far %d = %d (must be < 100).",
+            args.close,
+            args.far,
+            args.close + args.far,
+        )
+        return 1
 
     # Resolve and validate input
     input_path = Path(args.input).resolve()
@@ -844,6 +1007,10 @@ def main() -> int:
     logger.info("Device:   %s", args.device)
     logger.info("Format:   %s", args.format)
     logger.info("Batch:    %d", args.batch)
+    if args.auto_contrast:
+        logger.info("Contrast: auto")
+    else:
+        logger.info("Contrast: close=%d far=%d gamma=%.2f", args.close, args.far, args.gamma)
 
     # Run processing
     try:
@@ -855,6 +1022,10 @@ def main() -> int:
             device_pref=args.device,
             invert=not args.no_invert,
             batch_size=args.batch,
+            close=args.close,
+            far=args.far,
+            gamma=args.gamma,
+            auto_contrast=args.auto_contrast,
         )
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
